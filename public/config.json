@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "default": {
+      "brand_name": "ArsenVPN",
+      "total_gb": 50,
+      "expire_days": 30,
+      "personal": [],
+      "subs": [
+        "https://digikala.panel4-4.workers.dev/sub?token=dc537ec576c74d87118faf73934fdaf4"
+      ],
+      "top_count": 20
+    }
+  }
+}
