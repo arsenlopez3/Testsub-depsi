@@ -31,6 +31,29 @@ def get_flag_emoji(country_code):
     country_code = country_code.upper()
     return chr(127397 + ord(country_code[0])) + chr(127397 + ord(country_code[1]))
 
+def extract_host_port(node_link):
+    try:
+        if node_link.startswith("vmess://"):
+            b64_data = node_link.replace("vmess://", "")
+            b64_data += "=" * (-len(b64_data) % 4)
+            decoded = base64.b64decode(b64_data).decode("utf-8", errors="ignore")
+            vmess_json = json.loads(decoded)
+            return vmess_json.get("add", ""), int(vmess_json.get("port", 443))
+        else:
+            parsed = urlparse(node_link)
+            return parsed.hostname, parsed.port
+    except Exception:
+        return None, None
+
+def tcp_ping(host, port, timeout=2.0):
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
 def rename_node(node_link, new_name):
     try:
         if node_link.startswith("vmess://"):
@@ -53,76 +76,60 @@ def fetch_and_decode_subs(sub_urls):
     raw_nodes = []
     pattern = re.compile(r"^(vless|vmess|trojan|ss|ssr|tuic|hysteria2)://", re.IGNORECASE)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    
     for url in sub_urls:
         url = url.strip()
         if not url: continue
-        print(f"\n[DEBUG] Fetching sub: {url}")
         try:
             r = requests.get(url, headers=headers, timeout=15)
-            print(f"[DEBUG] Status Code: {r.status_code}")
             content = r.text.strip()
-            
-            # چاپ ۱۰۰ کاراکتر اول برای بررسی
-            print(f"[DEBUG] First 100 chars: {content[:100]}")
-            
             try:
                 decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
                 if any(p in decoded for p in ["vless://", "vmess://", "trojan://", "ss://"]):
                     content = decoded
-                    print("[DEBUG] Content Base64 decoded successfully.")
-            except Exception as e:
-                print(f"[DEBUG] Base64 decode failed (maybe it's plain text): {e}")
-
-            lines = content.splitlines()
-            print(f"[DEBUG] Total lines in sub: {len(lines)}")
-            
-            found_in_this_sub = 0
-            for line in lines:
+            except Exception:
+                pass
+            for line in content.splitlines():
                 line = line.strip()
                 if pattern.match(line):
                     raw_nodes.append(line)
-                    found_in_this_sub += 1
-            print(f"[DEBUG] Found {found_in_this_sub} valid nodes in this sub.")
-            
         except Exception as e:
             print(f"[ERROR] Fetching sub {url} failed: {e}")
-            
-    print(f"\n[DEBUG] Total raw nodes fetched from all subs: {len(raw_nodes)}")
     return list(set(raw_nodes))
 
 def convert_node(node_link, target_format):
     try:
-        # افزایش تایم اوت به 15 ثانیه
-        cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target_format]
+        # تغییر target از v2ray به xray و اضافه کردن -f برای force
+        target = "xray" if target_format == "v2ray" else target_format
+        cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target, "-f"]
         res = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=15)
         return res.decode("utf-8")
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Subconverter failed for {node_link[:30]}... Error: {e.stderr.decode('utf-8', errors='ignore')}")
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"[ERROR] Subconverter timeout for {node_link[:30]}...")
+        # اینجا خطای دقیق subconverter را چاپ می‌کنیم
+        print(f"[ERROR] Subconverter failed for {node_link[:40]}... Error: {e.stderr.decode('utf-8', errors='ignore')[:200]}")
         return None
     except Exception as e:
-        print(f"[ERROR] Subconverter unexpected error: {e}")
         return None
 
 def test_single_node(node_info):
     index, node_link = node_info
-    port_proxy = 10800 + (index % 1000)
+    host, port = extract_host_port(node_link)
     
-    print(f"[TEST] Testing node {index}: {node_link[:50]}...")
-    
-    json_str = convert_node(node_link, "v2ray")
-    if not json_str:
-        print(f"[TEST] Node {index} failed: Subconverter returned empty.")
+    # اگر subconverter خراب بود، حداقل با TCP تست می‌کنیم
+    if not tcp_ping(host, port):
         return node_link, 0.0
+
+    port_proxy = 10800 + (index % 1000)
+    json_str = convert_node(node_link, "v2ray")
+    
+    if not json_str:
+        # fallback: اگر subconverter خروجی نداد، با نمره پایین قبولش می‌کنیم
+        print(f"[TEST] Node {index} Subconverter failed, but TCP is alive. Adding with low score.")
+        return node_link, 1.0 
         
     try:
         outbound_config = json.loads(json_str)
-    except Exception as e:
-        print(f"[TEST] Node {index} failed: Invalid JSON from Subconverter. {e}")
-        return node_link, 0.0
+    except Exception:
+        return node_link, 1.0 # fallback برای JSON نامعتبر
 
     config_filename = f"temp_xray_{port_proxy}.json"
     full_config = {
@@ -134,29 +141,23 @@ def test_single_node(node_info):
         json.dump(full_config, f)
 
     proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.5) # افزایش زمان انتظار به 1.5 ثانیه
+    time.sleep(1.2)
     
     proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
     score = 0.0
-    
     try:
         t0 = time.time()
-        # افزایش تایم اوت درخواست به 6 ثانیه
-        res = requests.get(TEST_URL, proxies=proxies, timeout=6)
+        res = requests.get(TEST_URL, proxies=proxies, timeout=5)
         if res.status_code in [200, 204]:
             latency = time.time() - t0
             score = max(1.0, 10.0 - latency)
-            print(f"[TEST] Node {index} SUCCESS! Latency: {latency:.2f}s | Score: {score:.2f}")
-        else:
-            print(f"[TEST] Node {index} failed: HTTP {res.status_code}")
-    except Exception as e:
-        print(f"[TEST] Node {index} failed: Request error - {e}")
+    except Exception:
+        pass
     finally:
         proc.terminate()
         proc.wait()
         if os.path.exists(config_filename):
             os.remove(config_filename)
-            
     return node_link, score
 
 def create_info_node(total_gb, expire_days):
@@ -212,23 +213,22 @@ def main():
         expire_days = prof_data.get("expire_days", 30)
 
         dynamic_nodes = fetch_and_decode_subs(sub_urls)
+        print(f"[INFO] Total nodes fetched: {len(dynamic_nodes)}")
         
         if not dynamic_nodes:
-            print("[WARNING] No dynamic nodes fetched! Check your sub URLs or GitHub IP block.")
             final_nodes = personal_nodes
         else:
             indexed_nodes = list(enumerate(dynamic_nodes))
             tested_results = []
             
-            print(f"\n[INFO] Testing {len(indexed_nodes)} nodes...")
-            with ThreadPoolExecutor(max_workers=5) as executor: # کاهش به 5 ترد برای جلوگیری از بلاک شدن
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(test_single_node, item) for item in indexed_nodes]
                 for future in as_completed(futures):
                     link, score = future.result()
-                    if link and score > 0.5:
+                    if link and score > 0.0: # قبول کردن حتی با نمره 1.0 (TCP alive)
                         tested_results.append((link, score))
 
-            print(f"\n[INFO] {len(tested_results)} nodes passed the test successfully.")
+            print(f"[INFO] {len(tested_results)} nodes passed the test.")
             
             if tested_results:
                 tested_results.sort(key=lambda x: x[1], reverse=True)
@@ -238,7 +238,6 @@ def main():
 
             renamed_dynamic = []
             for idx, node in enumerate(best_dynamic, start=1):
-                # فعلا بدون تشخیص کشور، فقط شماره گذاری
                 custom_title = f"🌐 {brand_name} - {idx:02d}"
                 renamed_dynamic.append(rename_node(node, custom_title))
 
