@@ -7,7 +7,7 @@ import subprocess
 import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, parse_qs
 import requests
 
 CONFIG_PATH = "public/config.json"
@@ -40,12 +40,12 @@ def extract_host_port(node_link):
             vmess_json = json.loads(decoded)
             return vmess_json.get("add", ""), int(vmess_json.get("port", 443))
         else:
-            parsed = urlparse(node_link)
+            parsed = urlparse(node_link.split("#")[0])
             return parsed.hostname, parsed.port
     except Exception:
         return None, None
 
-def tcp_ping(host, port, timeout=2.0):
+def tcp_ping(host, port, timeout=1.5):
     if not host or not port:
         return False
     try:
@@ -96,17 +96,89 @@ def fetch_and_decode_subs(sub_urls):
             print(f"[ERROR] Fetching sub {url} failed: {e}")
     return list(set(raw_nodes))
 
-def convert_node(node_link, target_format):
+# ================= پارسر اختصاصی VLESS (جایگزین subconverter) =================
+def parse_vless_to_xray(node_link):
+    """تبدیل مستقیم لینک VLESS به کانفیگ Xray بدون نیاز به subconverter"""
     try:
-        target = "xray" if target_format == "v2ray" else target_format
-        cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target, "-f"]
+        link = node_link.split("#")[0] if "#" in node_link else node_link
+        parsed = urlparse(link)
+        uuid = parsed.username
+        host = parsed.hostname
+        port = parsed.port
+        params = parse_qs(parsed.query)
+        
+        network = params.get("type", ["tcp"])[0]
+        security = params.get("security", ["none"])[0]
+        
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": host,
+                    "port": port,
+                    "users": [{"id": uuid, "encryption": "none"}]
+                }]
+            },
+            "streamSettings": {
+                "network": network,
+                "security": security
+            }
+        }
+        
+        flow = params.get("flow", [""])[0]
+        if flow:
+            outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
+            
+        if network == "ws":
+            path = params.get("path", ["/"])[0]
+            host_header = params.get("host", [host])[0]
+            outbound["streamSettings"]["wsSettings"] = {
+                "path": path,
+                "headers": {"Host": host_header}
+            }
+        elif network == "tcp":
+            header_type = params.get("headerType", ["none"])[0]
+            outbound["streamSettings"]["tcpSettings"] = {"header": {"type": header_type}}
+        elif network == "grpc":
+            service_name = params.get("serviceName", [""])[0]
+            outbound["streamSettings"]["grpcSettings"] = {"serviceName": service_name}
+        
+        if security == "tls":
+            sni = params.get("sni", [""])[0] or params.get("host", [""])[0] or host
+            fp = params.get("fp", [""])[0]
+            outbound["streamSettings"]["tlsSettings"] = {"serverName": sni}
+            if fp:
+                outbound["streamSettings"]["tlsSettings"]["fingerprint"] = fp
+        elif security == "reality":
+            sni = params.get("sni", [""])[0]
+            fp = params.get("fp", ["chrome"])[0]
+            pbk = params.get("pbk", [""])[0]
+            sid = params.get("sid", [""])[0]
+            spx = params.get("spx", ["/"])[0]
+            outbound["streamSettings"]["realitySettings"] = {
+                "serverName": sni,
+                "fingerprint": fp,
+                "publicKey": pbk,
+                "shortId": sid,
+                "spiderX": spx
+            }
+            
+        return json.dumps(outbound)
+    except Exception as e:
+        print(f"[PARSE ERROR] Failed to parse {node_link[:40]}: {e}")
+        return None
+# ==============================================================================
+
+def convert_node(node_link, target_format):
+    """فقط برای تولید نهایی Clash و Singbox استفاده می‌شود"""
+    try:
+        cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target_format, "-f"]
         res = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=15)
         return res.decode("utf-8")
     except Exception:
         return None
 
 def test_single_node(node_info):
-    """تست سرعت و فیلتر کردن نودهای مرده"""
     index, node_link = node_info
     host, port = extract_host_port(node_link)
     
@@ -114,17 +186,20 @@ def test_single_node(node_info):
         return node_link, 0.0
 
     port_proxy = 10800 + (index % 1000)
-    json_str = convert_node(node_link, "v2ray")
+    
+    # استفاده از پارسر اختصاصی به جای subconverter
+    if node_link.startswith("vless://"):
+        json_str = parse_vless_to_xray(node_link)
+    else:
+        json_str = convert_node(node_link, "xray")
     
     if not json_str:
-        # اگر سابکانورتر خراب بود، با نمره پایین (0.5) قبولش می‌کنیم تا حذف نشود
-        # اما بعداً فیلترهای سختگیرانه‌تری اعمال می‌کنیم
-        return node_link, 0.5 
+        return node_link, 0.0
         
     try:
         outbound_config = json.loads(json_str)
     except Exception:
-        return node_link, 0.5
+        return node_link, 0.0
 
     config_filename = f"temp_xray_{port_proxy}.json"
     full_config = {
@@ -136,18 +211,19 @@ def test_single_node(node_info):
         json.dump(full_config, f)
 
     proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.2)
+    time.sleep(1.5)
     
     proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
     score = 0.0
     try:
         t0 = time.time()
-        res = requests.get(TEST_URL, proxies=proxies, timeout=5)
+        res = requests.get(TEST_URL, proxies=proxies, timeout=6)
         if res.status_code in [200, 204]:
             latency = time.time() - t0
             score = max(1.0, 10.0 - latency)
-    except Exception:
-        pass
+            print(f"[TEST] Node {index} SUCCESS! Latency: {latency:.2f}s | Score: {score:.2f}")
+    except Exception as e:
+        print(f"[TEST] Node {index} failed: {e}")
     finally:
         proc.terminate()
         proc.wait()
@@ -156,11 +232,14 @@ def test_single_node(node_info):
     return node_link, score
 
 def get_exit_country(node_info):
-    """تشخیص دقیق کشور از داخل تونل (فقط برای نودهای سالم)"""
     index, node_link = node_info
     port_proxy = 20000 + (index % 1000)
     
-    json_str = convert_node(node_link, "v2ray")
+    if node_link.startswith("vless://"):
+        json_str = parse_vless_to_xray(node_link)
+    else:
+        json_str = convert_node(node_link, "xray")
+        
     if not json_str:
         return node_link, ""
     try:
@@ -178,7 +257,7 @@ def get_exit_country(node_info):
         json.dump(full_config, f)
 
     proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.2)
+    time.sleep(1.5)
     
     proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
     country_code = ""
@@ -210,6 +289,8 @@ def generate_outputs(profile_name, final_nodes, total_gb, expire_days):
     b64_out = base64.b64encode("\n".join(all_nodes_with_info).encode("utf-8")).decode("utf-8")
     with open(os.path.join(profile_dir, "sub.txt"), "w", encoding="utf-8") as f:
         f.write(b64_out)
+    
+    # برای Clash و Singbox از subconverter استفاده می‌کنیم
     joined_nodes = "|".join(final_nodes)
     clash_yaml = convert_node(joined_nodes, "clash")
     if clash_yaml:
@@ -255,33 +336,28 @@ def main():
             indexed_nodes = list(enumerate(dynamic_nodes))
             tested_results = []
             
-            # === مرحله ۱: تست سرعت (حذف نودهای مرده) ===
             print("[INFO] Testing speed of all nodes...")
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(test_single_node, item) for item in indexed_nodes]
                 for future in as_completed(futures):
                     link, score = future.result()
-                    # فقط نودهایی که نمره بالای 1.5 دارند (یعنی واقعاً کار می‌کنند)
-                    if link and score > 1.5: 
+                    if link and score > 1.0: # فیلتر نودهای مرده
                         tested_results.append((link, score))
 
             print(f"[INFO] {len(tested_results)} nodes passed the speed test.")
             
             if tested_results:
                 tested_results.sort(key=lambda x: x[1], reverse=True)
-                # انتخاب ۱.۵ برابر تعداد مورد نیاز برای تست کشور
                 top_candidates = tested_results[:int(top_count * 1.5)]
                 
-                # === مرحله ۲: تشخیص دقیق کشور ===
                 print(f"[INFO] Detecting country for {len(top_candidates)} best nodes...")
                 geo_results = []
-                with ThreadPoolExecutor(max_workers=3) as executor: # کاهش به ۳ ترد برای جلوگیری از بلاک شدن ip-api
+                with ThreadPoolExecutor(max_workers=3) as executor:
                     futures = [executor.submit(get_exit_country, (i, item[0])) for i, item in enumerate(top_candidates)]
                     for future in as_completed(futures):
                         link, country_code = future.result()
                         geo_results.append((link, country_code))
                 
-                # مرتب‌سازی نهایی و اضافه کردن پرچم
                 final_dynamic = []
                 for link, score in tested_results:
                     for geo_link, country_code in geo_results:
