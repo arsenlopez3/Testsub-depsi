@@ -37,7 +37,8 @@
         "aether://[2606:4700:d1:0:9455:f422:e08f:e40e]:946?protocol=wg&scan=turbo&ip=v6&psiphon=chain&psiphon_mode=auto&region=ZA#South-Africa%20%F0%9F%87%BF%F0%9F%87%A6"
       ],
       "subs": [
-        "https://digikala.panel4-4.workers.dev/sub?token=dc537ec576c74d87118faf73934fdaf4"
+        "https://digikala.panel4-4.workers.dev/sub?token=dc537ec576c74d87118faf73934fdaf4",
+        "https://arsen68-nh-speednet.panel4-4.workers.dev/sync?sub=Nafas"
       ],
       "top_count": 20
     }
