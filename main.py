@@ -23,47 +23,13 @@ def load_config():
                     return data
         except Exception:
             pass
-    return {
-        "profiles": {
-            "default": {
-                "brand_name": "ArsenVPN",
-                "total_gb": 50,
-                "expire_days": 30,
-                "personal": [],
-                "subs": [],
-                "top_count": 20,
-            }
-        }
-    }
+    return {"profiles": {"default": {"brand_name": "ArsenVPN", "total_gb": 50, "expire_days": 30, "personal": [], "subs": [], "top_count": 20}}}
 
 def get_flag_emoji(country_code):
     if not country_code or len(country_code) != 2:
         return "🌐"
     country_code = country_code.upper()
     return chr(127397 + ord(country_code[0])) + chr(127397 + ord(country_code[1]))
-
-def extract_host_port(node_link):
-    try:
-        if node_link.startswith("vmess://"):
-            b64_data = node_link.replace("vmess://", "")
-            b64_data += "=" * (-len(b64_data) % 4)
-            decoded = base64.b64decode(b64_data).decode("utf-8", errors="ignore")
-            vmess_json = json.loads(decoded)
-            return vmess_json.get("add", ""), int(vmess_json.get("port", 443))
-        else:
-            parsed = urlparse(node_link)
-            return parsed.hostname, parsed.port
-    except Exception:
-        return None, None
-
-def tcp_ping(host, port, timeout=1.5):
-    if not host or not port:
-        return False
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
 
 def rename_node(node_link, new_name):
     try:
@@ -86,50 +52,77 @@ def rename_node(node_link, new_name):
 def fetch_and_decode_subs(sub_urls):
     raw_nodes = []
     pattern = re.compile(r"^(vless|vmess|trojan|ss|ssr|tuic|hysteria2)://", re.IGNORECASE)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    
     for url in sub_urls:
         url = url.strip()
         if not url: continue
+        print(f"\n[DEBUG] Fetching sub: {url}")
         try:
-            r = requests.get(url, headers=headers, timeout=12)
+            r = requests.get(url, headers=headers, timeout=15)
+            print(f"[DEBUG] Status Code: {r.status_code}")
             content = r.text.strip()
+            
+            # چاپ ۱۰۰ کاراکتر اول برای بررسی
+            print(f"[DEBUG] First 100 chars: {content[:100]}")
+            
             try:
                 decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
                 if any(p in decoded for p in ["vless://", "vmess://", "trojan://", "ss://"]):
                     content = decoded
-            except Exception:
-                pass
-            for line in content.splitlines():
+                    print("[DEBUG] Content Base64 decoded successfully.")
+            except Exception as e:
+                print(f"[DEBUG] Base64 decode failed (maybe it's plain text): {e}")
+
+            lines = content.splitlines()
+            print(f"[DEBUG] Total lines in sub: {len(lines)}")
+            
+            found_in_this_sub = 0
+            for line in lines:
                 line = line.strip()
                 if pattern.match(line):
                     raw_nodes.append(line)
+                    found_in_this_sub += 1
+            print(f"[DEBUG] Found {found_in_this_sub} valid nodes in this sub.")
+            
         except Exception as e:
-            print(f"Error fetching sub {url}: {e}")
+            print(f"[ERROR] Fetching sub {url} failed: {e}")
+            
+    print(f"\n[DEBUG] Total raw nodes fetched from all subs: {len(raw_nodes)}")
     return list(set(raw_nodes))
 
 def convert_node(node_link, target_format):
     try:
+        # افزایش تایم اوت به 15 ثانیه
         cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target_format]
-        res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=8)
+        res = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=15)
         return res.decode("utf-8")
-    except Exception:
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Subconverter failed for {node_link[:30]}... Error: {e.stderr.decode('utf-8', errors='ignore')}")
+        return None
+    except subprocess.TimeoutExpired:
+        print(f"[ERROR] Subconverter timeout for {node_link[:30]}...")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Subconverter unexpected error: {e}")
         return None
 
 def test_single_node(node_info):
-    """مرحله اول: تست پینگ و سرعت (بدون تشخیص کشور)"""
     index, node_link = node_info
-    host, port = extract_host_port(node_link)
-    if not tcp_ping(host, port):
-        return node_link, 0.0
-
     port_proxy = 10800 + (index % 1000)
+    
+    print(f"[TEST] Testing node {index}: {node_link[:50]}...")
+    
     json_str = convert_node(node_link, "v2ray")
     if not json_str:
-        return node_link, 0.1
+        print(f"[TEST] Node {index} failed: Subconverter returned empty.")
+        return node_link, 0.0
+        
     try:
         outbound_config = json.loads(json_str)
-    except Exception:
-        return node_link, 0.1
+    except Exception as e:
+        print(f"[TEST] Node {index} failed: Invalid JSON from Subconverter. {e}")
+        return node_link, 0.0
 
     config_filename = f"temp_xray_{port_proxy}.json"
     full_config = {
@@ -141,68 +134,30 @@ def test_single_node(node_info):
         json.dump(full_config, f)
 
     proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.8)
+    time.sleep(1.5) # افزایش زمان انتظار به 1.5 ثانیه
     
     proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
-    score = 0.1
+    score = 0.0
+    
     try:
         t0 = time.time()
-        res = requests.get(TEST_URL, proxies=proxies, timeout=4)
+        # افزایش تایم اوت درخواست به 6 ثانیه
+        res = requests.get(TEST_URL, proxies=proxies, timeout=6)
         if res.status_code in [200, 204]:
             latency = time.time() - t0
             score = max(1.0, 10.0 - latency)
-    except Exception:
-        pass
-    finally:
-        proc.terminate()
-        proc.wait()
-        if os.path.exists(config_filename):
-            os.remove(config_filename)
-    return node_link, score
-
-def get_exit_country(node_info):
-    """مرحله دوم: تشخیص دقیق کشور از داخل تونل"""
-    index, node_link = node_info
-    port_proxy = 20000 + (index % 1000)
-    
-    json_str = convert_node(node_link, "v2ray")
-    if not json_str:
-        return node_link, ""
-    try:
-        outbound_config = json.loads(json_str)
-    except Exception:
-        return node_link, ""
-
-    config_filename = f"temp_xray_geo_{port_proxy}.json"
-    full_config = {
-        "log": {"loglevel": "none"},
-        "inbounds": [{"port": port_proxy, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
-        "outbounds": [outbound_config],
-    }
-    with open(config_filename, "w", encoding="utf-8") as f:
-        json.dump(full_config, f)
-
-    proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    
-    proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
-    country_code = ""
-    
-    # درخواست به ip-api از داخل تونل
-    try:
-        res = requests.get("http://ip-api.com/json/", proxies=proxies, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            country_code = data.get("countryCode", "")
-    except Exception:
-        pass
+            print(f"[TEST] Node {index} SUCCESS! Latency: {latency:.2f}s | Score: {score:.2f}")
+        else:
+            print(f"[TEST] Node {index} failed: HTTP {res.status_code}")
+    except Exception as e:
+        print(f"[TEST] Node {index} failed: Request error - {e}")
     finally:
         proc.terminate()
         proc.wait()
         if os.path.exists(config_filename):
             os.remove(config_filename)
             
-    return node_link, country_code
+    return node_link, score
 
 def create_info_node(total_gb, expire_days):
     info_title = f"📊 Traffic: {total_gb} GB | ⏳ Remaining: {expire_days} Days"
@@ -212,26 +167,20 @@ def create_info_node(total_gb, expire_days):
 def generate_outputs(profile_name, final_nodes, total_gb, expire_days):
     profile_dir = os.path.join("public", profile_name)
     os.makedirs(profile_dir, exist_ok=True)
-
     info_node = create_info_node(total_gb, expire_days)
     all_nodes_with_info = [info_node] + final_nodes
-
     b64_out = base64.b64encode("\n".join(all_nodes_with_info).encode("utf-8")).decode("utf-8")
     with open(os.path.join(profile_dir, "sub.txt"), "w", encoding="utf-8") as f:
         f.write(b64_out)
-
     joined_nodes = "|".join(final_nodes)
-
     clash_yaml = convert_node(joined_nodes, "clash")
     if clash_yaml:
         with open(os.path.join(profile_dir, "clash.yaml"), "w", encoding="utf-8") as f:
             f.write(clash_yaml)
-
     singbox_json = convert_node(joined_nodes, "singbox")
     if singbox_json:
         with open(os.path.join(profile_dir, "singbox.json"), "w", encoding="utf-8") as f:
             f.write(singbox_json)
-            
     print(f"✅ فایل‌های پروفایل {profile_name} ذخیره شدند.")
 
 def cleanup_removed_profiles(active_profiles):
@@ -242,7 +191,6 @@ def cleanup_removed_profiles(active_profiles):
             if item not in active_profiles:
                 try:
                     shutil.rmtree(item_path)
-                    print(f"🗑️ پوشه حذف‌شده پاک شد: {item}")
                 except Exception:
                     pass
 
@@ -250,10 +198,12 @@ def main():
     config = load_config()
     profiles = config.get("profiles", {})
     cleanup_removed_profiles(profiles.keys())
-    print(f"شروع فرایند برای {len(profiles)} پروفایل...")
-
+    
     for prof_name, prof_data in profiles.items():
-        print(f"\n--- پردازش پروفایل: {prof_name} ---")
+        print(f"\n{'='*50}")
+        print(f"--- پردازش پروفایل: {prof_name} ---")
+        print(f"{'='*50}")
+        
         personal_nodes = prof_data.get("personal", [])
         sub_urls = prof_data.get("subs", [])
         top_count = prof_data.get("top_count", 20)
@@ -262,54 +212,38 @@ def main():
         expire_days = prof_data.get("expire_days", 30)
 
         dynamic_nodes = fetch_and_decode_subs(sub_urls)
-        print(f"تعداد {len(dynamic_nodes)} سرور دریافت شد.")
-
-        if dynamic_nodes:
+        
+        if not dynamic_nodes:
+            print("[WARNING] No dynamic nodes fetched! Check your sub URLs or GitHub IP block.")
+            final_nodes = personal_nodes
+        else:
             indexed_nodes = list(enumerate(dynamic_nodes))
-            
-            # === مرحله ۱: تست سرعت و پینگ ===
-            print("در حال تست سرعت نودها...")
             tested_results = []
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            
+            print(f"\n[INFO] Testing {len(indexed_nodes)} nodes...")
+            with ThreadPoolExecutor(max_workers=5) as executor: # کاهش به 5 ترد برای جلوگیری از بلاک شدن
                 futures = [executor.submit(test_single_node, item) for item in indexed_nodes]
                 for future in as_completed(futures):
                     link, score = future.result()
                     if link and score > 0.5:
                         tested_results.append((link, score))
 
-            tested_results.sort(key=lambda x: x[1], reverse=True)
-            # فقط ۱.۵ برابر تعداد مورد نیاز را برمی‌داریم تا وقت کمتری تلف شود
-            top_candidates = tested_results[:int(top_count * 1.5)]
+            print(f"\n[INFO] {len(tested_results)} nodes passed the test successfully.")
             
-            # === مرحله ۲: تشخیص دقیق کشور برای نودهای برتر ===
-            print(f"در حال تشخیص کشور {len(top_candidates)} نود برتر...")
-            geo_results = []
-            # از ۵ ترد استفاده می‌کنیم تا به محدودیت ip-api برخورد نکنیم
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(get_exit_country, (i, item[0])) for i, item in enumerate(top_candidates)]
-                for future in as_completed(futures):
-                    link, country_code = future.result()
-                    geo_results.append((link, country_code))
-
-            # مرتب‌سازی نهایی بر اساس امتیاز اولیه و برش به تعداد top_count
-            final_dynamic = []
-            for link, score in tested_results:
-                for geo_link, country_code in geo_results:
-                    if link == geo_link:
-                        flag = get_flag_emoji(country_code) if country_code else "🌐"
-                        final_dynamic.append((link, flag))
-                        break
-                if len(final_dynamic) >= top_count:
-                    break
+            if tested_results:
+                tested_results.sort(key=lambda x: x[1], reverse=True)
+                best_dynamic = [x[0] for x in tested_results[:top_count]]
+            else:
+                best_dynamic = []
 
             renamed_dynamic = []
-            for idx, (node, flag) in enumerate(final_dynamic, start=1):
-                custom_title = f"{flag} {brand_name} - {idx:02d}"
+            for idx, node in enumerate(best_dynamic, start=1):
+                # فعلا بدون تشخیص کشور، فقط شماره گذاری
+                custom_title = f"🌐 {brand_name} - {idx:02d}"
                 renamed_dynamic.append(rename_node(node, custom_title))
-        else:
-            renamed_dynamic = []
 
-        final_nodes = personal_nodes + renamed_dynamic
+            final_nodes = personal_nodes + renamed_dynamic
+
         generate_outputs(prof_name, final_nodes, total_gb, expire_days)
 
     print("\n🎉 عملیات با موفقیت تمام شد.")
