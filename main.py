@@ -41,11 +41,13 @@ def extract_host_port(node_link):
             return vmess_json.get("add", ""), int(vmess_json.get("port", 443))
         else:
             parsed = urlparse(node_link.split("#")[0])
-            return parsed.hostname, parsed.port
+            host = parsed.hostname
+            port = parsed.port or 443
+            return host, port
     except Exception:
         return None, None
 
-def tcp_ping(host, port, timeout=1.5):
+def tcp_ping(host, port, timeout=2.0):
     if not host or not port:
         return False
     try:
@@ -96,15 +98,14 @@ def fetch_and_decode_subs(sub_urls):
             print(f"[ERROR] Fetching sub {url} failed: {e}")
     return list(set(raw_nodes))
 
-# ================= پارسر اختصاصی VLESS (جایگزین subconverter) =================
 def parse_vless_to_xray(node_link):
-    """تبدیل مستقیم لینک VLESS به کانفیگ Xray بدون نیاز به subconverter"""
+    """پارسر اصلاح‌شده و مقاوم VLESS"""
     try:
         link = node_link.split("#")[0] if "#" in node_link else node_link
         parsed = urlparse(link)
         uuid = parsed.username
         host = parsed.hostname
-        port = parsed.port
+        port = parsed.port or 443
         params = parse_qs(parsed.query)
         
         network = params.get("type", ["tcp"])[0]
@@ -145,10 +146,12 @@ def parse_vless_to_xray(node_link):
         
         if security == "tls":
             sni = params.get("sni", [""])[0] or params.get("host", [""])[0] or host
-            fp = params.get("fp", [""])[0]
-            outbound["streamSettings"]["tlsSettings"] = {"serverName": sni}
-            if fp:
-                outbound["streamSettings"]["tlsSettings"]["fingerprint"] = fp
+            fp = params.get("fp", ["chrome"])[0]
+            outbound["streamSettings"]["tlsSettings"] = {
+                "serverName": sni,
+                "allowInsecure": True,
+                "fingerprint": fp
+            }
         elif security == "reality":
             sni = params.get("sni", [""])[0]
             fp = params.get("fp", ["chrome"])[0]
@@ -160,17 +163,15 @@ def parse_vless_to_xray(node_link):
                 "fingerprint": fp,
                 "publicKey": pbk,
                 "shortId": sid,
-                "spiderX": spx
+                "spiderX": spx,
+                "allowInsecure": True
             }
             
         return json.dumps(outbound)
     except Exception as e:
-        print(f"[PARSE ERROR] Failed to parse {node_link[:40]}: {e}")
         return None
-# ==============================================================================
 
 def convert_node(node_link, target_format):
-    """فقط برای تولید نهایی Clash و Singbox استفاده می‌شود"""
     try:
         cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target_format, "-f"]
         res = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=15)
@@ -187,13 +188,13 @@ def test_single_node(node_info):
 
     port_proxy = 10800 + (index % 1000)
     
-    # استفاده از پارسر اختصاصی به جای subconverter
     if node_link.startswith("vless://"):
         json_str = parse_vless_to_xray(node_link)
     else:
         json_str = convert_node(node_link, "xray")
     
     if not json_str:
+        print(f"[TEST] Node {index} failed: Could not generate Xray config.")
         return node_link, 0.0
         
     try:
@@ -203,15 +204,16 @@ def test_single_node(node_info):
 
     config_filename = f"temp_xray_{port_proxy}.json"
     full_config = {
-        "log": {"loglevel": "none"},
+        "log": {"loglevel": "warning"}, # تغییر به warning برای دیدن خطاها
         "inbounds": [{"port": port_proxy, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
         "outbounds": [outbound_config],
     }
     with open(config_filename, "w", encoding="utf-8") as f:
         json.dump(full_config, f)
 
-    proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.5)
+    # اجرای Xray و ذخیره خطاها
+    proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(2.0) # افزایش زمان انتظار به 2 ثانیه
     
     proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
     score = 0.0
@@ -222,8 +224,17 @@ def test_single_node(node_info):
             latency = time.time() - t0
             score = max(1.0, 10.0 - latency)
             print(f"[TEST] Node {index} SUCCESS! Latency: {latency:.2f}s | Score: {score:.2f}")
+        else:
+            print(f"[TEST] Node {index} failed: HTTP {res.status_code}")
     except Exception as e:
-        print(f"[TEST] Node {index} failed: {e}")
+        # چاپ خطای دقیق Xray
+        proc.terminate()
+        stdout, stderr = proc.communicate()
+        xray_error = stderr.decode('utf-8', errors='ignore').strip()
+        if xray_error:
+            print(f"[XRAY ERROR] Node {index}: {xray_error[:200]}")
+        else:
+            print(f"[TEST] Node {index} failed: Connection timed out.")
     finally:
         proc.terminate()
         proc.wait()
@@ -290,7 +301,6 @@ def generate_outputs(profile_name, final_nodes, total_gb, expire_days):
     with open(os.path.join(profile_dir, "sub.txt"), "w", encoding="utf-8") as f:
         f.write(b64_out)
     
-    # برای Clash و Singbox از subconverter استفاده می‌کنیم
     joined_nodes = "|".join(final_nodes)
     clash_yaml = convert_node(joined_nodes, "clash")
     if clash_yaml:
@@ -337,11 +347,11 @@ def main():
             tested_results = []
             
             print("[INFO] Testing speed of all nodes...")
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=3) as executor: # کاهش تردها برای جلوگیری از ریسورس
                 futures = [executor.submit(test_single_node, item) for item in indexed_nodes]
                 for future in as_completed(futures):
                     link, score = future.result()
-                    if link and score > 1.0: # فیلتر نودهای مرده
+                    if link and score > 1.0: 
                         tested_results.append((link, score))
 
             print(f"[INFO] {len(tested_results)} nodes passed the speed test.")
@@ -352,7 +362,7 @@ def main():
                 
                 print(f"[INFO] Detecting country for {len(top_candidates)} best nodes...")
                 geo_results = []
-                with ThreadPoolExecutor(max_workers=3) as executor:
+                with ThreadPoolExecutor(max_workers=2) as executor:
                     futures = [executor.submit(get_exit_country, (i, item[0])) for i, item in enumerate(top_candidates)]
                     for future in as_completed(futures):
                         link, country_code = future.result()
