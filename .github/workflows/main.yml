@@ -1,0 +1,73 @@
+name: Xray Smart Master Automation
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+# جلوگیری از اجرای همزمان چند ورک‌فلو
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # کش کردن Xray و Subconverter برای سرعت بالاتر
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            xray
+            subconverter
+          key: ${{ runner.os }}-tools-${{ hashFiles('main.py') }}
+
+      - name: Install Core Utilities
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          LATEST_XRAY=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST_XRAY}/Xray-linux-64.zip"
+          unzip xray.zip xray
+          chmod +x xray
+
+          curl -L -o subconverter.tar.gz "https://github.com/tindy2013/subconverter/releases/latest/download/subconverter_linux64.tar.gz"
+          tar -zxvf subconverter.tar.gz
+          chmod +x subconverter/subconverter
+
+      - name: Install Python Dependencies
+        run: pip install requests socksio
+
+      - name: Execute Master Script
+        run: python main.py
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+      - name: Commit Updated Config and Outputs
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto update nodes & timestamp" && git push)
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
