@@ -5,7 +5,6 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
-# جلوگیری از اجرای همزمان چند ورک‌فلو
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,7 +26,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      # کش کردن Xray و Subconverter برای سرعت بالاتر
       - name: Cache Tools
         id: cache-tools
         uses: actions/cache@v4
@@ -51,6 +49,18 @@ jobs:
 
       - name: Install Python Dependencies
         run: pip install requests socksio
+
+      # ===== نصب و راه‌اندازی Cloudflare WARP =====
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install cloudflare-warp -y
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos connect
+          warp-cli --accept-tos status
+      # ==========================================
 
       - name: Execute Master Script
         run: python main.py
