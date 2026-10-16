@@ -98,23 +98,18 @@ def fetch_and_decode_subs(sub_urls):
 
 def convert_node(node_link, target_format):
     try:
-        # تغییر target از v2ray به xray و اضافه کردن -f برای force
         target = "xray" if target_format == "v2ray" else target_format
         cmd = ["./subconverter/subconverter", "-g", "--generate-mode", "single", "--url", node_link, "--target", target, "-f"]
         res = subprocess.check_output(cmd, stderr=subprocess.PIPE, timeout=15)
         return res.decode("utf-8")
-    except subprocess.CalledProcessError as e:
-        # اینجا خطای دقیق subconverter را چاپ می‌کنیم
-        print(f"[ERROR] Subconverter failed for {node_link[:40]}... Error: {e.stderr.decode('utf-8', errors='ignore')[:200]}")
-        return None
-    except Exception as e:
+    except Exception:
         return None
 
 def test_single_node(node_info):
+    """تست سرعت و فیلتر کردن نودهای مرده"""
     index, node_link = node_info
     host, port = extract_host_port(node_link)
     
-    # اگر subconverter خراب بود، حداقل با TCP تست می‌کنیم
     if not tcp_ping(host, port):
         return node_link, 0.0
 
@@ -122,14 +117,14 @@ def test_single_node(node_info):
     json_str = convert_node(node_link, "v2ray")
     
     if not json_str:
-        # fallback: اگر subconverter خروجی نداد، با نمره پایین قبولش می‌کنیم
-        print(f"[TEST] Node {index} Subconverter failed, but TCP is alive. Adding with low score.")
-        return node_link, 1.0 
+        # اگر سابکانورتر خراب بود، با نمره پایین (0.5) قبولش می‌کنیم تا حذف نشود
+        # اما بعداً فیلترهای سختگیرانه‌تری اعمال می‌کنیم
+        return node_link, 0.5 
         
     try:
         outbound_config = json.loads(json_str)
     except Exception:
-        return node_link, 1.0 # fallback برای JSON نامعتبر
+        return node_link, 0.5
 
     config_filename = f"temp_xray_{port_proxy}.json"
     full_config = {
@@ -159,6 +154,48 @@ def test_single_node(node_info):
         if os.path.exists(config_filename):
             os.remove(config_filename)
     return node_link, score
+
+def get_exit_country(node_info):
+    """تشخیص دقیق کشور از داخل تونل (فقط برای نودهای سالم)"""
+    index, node_link = node_info
+    port_proxy = 20000 + (index % 1000)
+    
+    json_str = convert_node(node_link, "v2ray")
+    if not json_str:
+        return node_link, ""
+    try:
+        outbound_config = json.loads(json_str)
+    except Exception:
+        return node_link, ""
+
+    config_filename = f"temp_xray_geo_{port_proxy}.json"
+    full_config = {
+        "log": {"loglevel": "none"},
+        "inbounds": [{"port": port_proxy, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
+        "outbounds": [outbound_config],
+    }
+    with open(config_filename, "w", encoding="utf-8") as f:
+        json.dump(full_config, f)
+
+    proc = subprocess.Popen(["./xray", "run", "-c", config_filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.2)
+    
+    proxies = {"http": f"socks5h://127.0.0.1:{port_proxy}", "https": f"socks5h://127.0.0.1:{port_proxy}"}
+    country_code = ""
+    try:
+        res = requests.get("http://ip-api.com/json/", proxies=proxies, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            country_code = data.get("countryCode", "")
+    except Exception:
+        pass
+    finally:
+        proc.terminate()
+        proc.wait()
+        if os.path.exists(config_filename):
+            os.remove(config_filename)
+            
+    return node_link, country_code
 
 def create_info_node(total_gb, expire_days):
     info_title = f"📊 Traffic: {total_gb} GB | ⏳ Remaining: {expire_days} Days"
@@ -201,10 +238,7 @@ def main():
     cleanup_removed_profiles(profiles.keys())
     
     for prof_name, prof_data in profiles.items():
-        print(f"\n{'='*50}")
-        print(f"--- پردازش پروفایل: {prof_name} ---")
-        print(f"{'='*50}")
-        
+        print(f"\n--- پردازش پروفایل: {prof_name} ---")
         personal_nodes = prof_data.get("personal", [])
         sub_urls = prof_data.get("subs", [])
         top_count = prof_data.get("top_count", 20)
@@ -221,25 +255,49 @@ def main():
             indexed_nodes = list(enumerate(dynamic_nodes))
             tested_results = []
             
+            # === مرحله ۱: تست سرعت (حذف نودهای مرده) ===
+            print("[INFO] Testing speed of all nodes...")
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(test_single_node, item) for item in indexed_nodes]
                 for future in as_completed(futures):
                     link, score = future.result()
-                    if link and score > 0.0: # قبول کردن حتی با نمره 1.0 (TCP alive)
+                    # فقط نودهایی که نمره بالای 1.5 دارند (یعنی واقعاً کار می‌کنند)
+                    if link and score > 1.5: 
                         tested_results.append((link, score))
 
-            print(f"[INFO] {len(tested_results)} nodes passed the test.")
+            print(f"[INFO] {len(tested_results)} nodes passed the speed test.")
             
             if tested_results:
                 tested_results.sort(key=lambda x: x[1], reverse=True)
-                best_dynamic = [x[0] for x in tested_results[:top_count]]
-            else:
-                best_dynamic = []
+                # انتخاب ۱.۵ برابر تعداد مورد نیاز برای تست کشور
+                top_candidates = tested_results[:int(top_count * 1.5)]
+                
+                # === مرحله ۲: تشخیص دقیق کشور ===
+                print(f"[INFO] Detecting country for {len(top_candidates)} best nodes...")
+                geo_results = []
+                with ThreadPoolExecutor(max_workers=3) as executor: # کاهش به ۳ ترد برای جلوگیری از بلاک شدن ip-api
+                    futures = [executor.submit(get_exit_country, (i, item[0])) for i, item in enumerate(top_candidates)]
+                    for future in as_completed(futures):
+                        link, country_code = future.result()
+                        geo_results.append((link, country_code))
+                
+                # مرتب‌سازی نهایی و اضافه کردن پرچم
+                final_dynamic = []
+                for link, score in tested_results:
+                    for geo_link, country_code in geo_results:
+                        if link == geo_link:
+                            flag = get_flag_emoji(country_code) if country_code else "🌐"
+                            final_dynamic.append((link, flag))
+                            break
+                    if len(final_dynamic) >= top_count:
+                        break
 
-            renamed_dynamic = []
-            for idx, node in enumerate(best_dynamic, start=1):
-                custom_title = f"🌐 {brand_name} - {idx:02d}"
-                renamed_dynamic.append(rename_node(node, custom_title))
+                renamed_dynamic = []
+                for idx, (node, flag) in enumerate(final_dynamic, start=1):
+                    custom_title = f"{flag} {brand_name} - {idx:02d}"
+                    renamed_dynamic.append(rename_node(node, custom_title))
+            else:
+                renamed_dynamic = []
 
             final_nodes = personal_nodes + renamed_dynamic
 
